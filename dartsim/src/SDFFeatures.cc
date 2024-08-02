@@ -1096,10 +1096,48 @@ Identity SDFFeatures::ConstructSdfJoint(
     }
   }
 
+  dart::dynamics::BodyNode * _child_ref = _child; //Used for kinematic loop support
   {
     auto childsParentJoint = _child->getParentJoint();
     std::string parentName = worldParent? "world" : _parent->getName();
-    if (childsParentJoint->getType() != "FreeJoint")
+
+    // TODO: Currently, constrain is added for kinematic loop if joint name has constraint included.
+    // Find way to automatically check for kinematic loop.
+    if (_parent && _sdfJoint.Name().find("constraint") != std::string::npos)
+    {
+      gzwarn << "Asked to create a closed kinematic chain between links "
+             << "[" << _parent->getName() << "] and [" << _child->getName()
+             << "]. New node is created and WeldJointConstraint is created between the added node and parent.\n";
+
+      dart::dynamics::BodyNode::Properties bodyProperties;
+      bodyProperties.mName = _child->getName() + "_dummy";
+
+      // Free Joint is set first. It will be replaced to actual joint later.
+      dart::dynamics::FreeJoint::Properties jointProperties;
+      jointProperties.mName = _sdfJoint.Name() + "_FreeJoint_Constain";
+      const auto result = _child->getSkeleton()->createJointAndBodyNodePair<
+          dart::dynamics::FreeJoint>(_parent, jointProperties, bodyProperties);
+
+      _child_ref = result.second; // Replace to set actual joint later.
+
+      dart::dynamics::FreeJoint * const _joint = result.first;
+      _joint->setTransform(_child->getWorldTransform());
+
+      // Weld dummy node with _child node.
+      auto constraint = std::make_shared<dart::constraint::WeldJointConstraint>(
+      _child_ref, _child);
+      auto modelID = this->models.IdentityOf(_modelInfo.model);
+      auto worldID = this->GetWorldOfModelImpl(modelID);
+      this->worlds.at(worldID)->getConstraintSolver()->addConstraint(constraint);
+    }
+    else if (_sdfJoint.Name().find("free_joint") != std::string::npos)
+    {
+      // SDF does not support free joint.
+      // Any joint containing free_joint as joint name will be treated as free joint.
+      gzwarn << "free_joint was included as joint name. The joint type will be ignored and free joint will be adopted.\n";
+      return this->GenerateInvalidId();
+    }
+    else if (childsParentJoint->getType() != "FreeJoint")
     {
       gzerr << "Asked to create a joint between links "
              << "[" << parentName << "] as parent and ["
@@ -1121,10 +1159,10 @@ Identity SDFFeatures::ConstructSdfJoint(
   // Save the current transforms of the links so we remember it later
   const Eigen::Isometry3d T_parent =
       _parent ? _parent->getWorldTransform() : Eigen::Isometry3d::Identity();
-  const Eigen::Isometry3d T_child = _child->getWorldTransform();
+  const Eigen::Isometry3d T_child = _child_ref->getWorldTransform();
 
   const Eigen::Isometry3d T_joint =
-      _child->getWorldTransform() * ResolveSdfPose(_sdfJoint.SemanticPose());
+      _child_ref->getWorldTransform() * ResolveSdfPose(_sdfJoint.SemanticPose());
 
   const ::sdf::JointType type = _sdfJoint.Type();
   dart::dynamics::Joint *joint = nullptr;
@@ -1135,7 +1173,7 @@ Identity SDFFeatures::ConstructSdfJoint(
     // name and relative transforms to its parent and child, which will be taken
     // care of below. All other properties like joint limits, stiffness, etc,
     // will be the default values of +/- infinity or 0.0.
-    joint = _child->moveTo<dart::dynamics::BallJoint>(_parent);
+    joint = _child_ref->moveTo<dart::dynamics::BallJoint>(_parent);
   }
   // TODO(MXG): Consider adding dartsim support for a CONTINUOUS joint type.
   // Alternatively, support the CONTINUOUS joint type by wrapping the
@@ -1146,12 +1184,12 @@ Identity SDFFeatures::ConstructSdfJoint(
   else if (::sdf::JointType::PRISMATIC == type)
   {
     joint = ConstructSingleAxisJoint<dart::dynamics::PrismaticJoint>(
-          _modelInfo, _sdfJoint, _parent, _child, T_joint);
+          _modelInfo, _sdfJoint, _parent, _child_ref, T_joint);
   }
   else if (::sdf::JointType::REVOLUTE == type)
   {
     joint = ConstructSingleAxisJoint<dart::dynamics::RevoluteJoint>(
-          _modelInfo, _sdfJoint, _parent, _child, T_joint);
+          _modelInfo, _sdfJoint, _parent, _child_ref, T_joint);
   }
   // TODO(MXG): Consider adding dartsim support for a REVOLUTE2 joint type.
   // Alternatively, support the REVOLUTE2 joint type by wrapping two
@@ -1159,7 +1197,7 @@ Identity SDFFeatures::ConstructSdfJoint(
   else if (::sdf::JointType::SCREW == type)
   {
     auto *screw = ConstructSingleAxisJoint<dart::dynamics::ScrewJoint>(
-          _modelInfo, _sdfJoint, _parent, _child, T_joint);
+          _modelInfo, _sdfJoint, _parent, _child_ref, T_joint);
 
     screw->setPitch(InvertThreadPitch(_sdfJoint.ThreadPitch()));
     joint = screw;
@@ -1167,7 +1205,7 @@ Identity SDFFeatures::ConstructSdfJoint(
   else if (::sdf::JointType::UNIVERSAL == type)
   {
     joint = ConstructUniversalJoint(
-          _modelInfo, _sdfJoint, _parent, _child, T_joint);
+          _modelInfo, _sdfJoint, _parent, _child_ref, T_joint);
   }
   else
   {
@@ -1182,7 +1220,7 @@ Identity SDFFeatures::ConstructSdfJoint(
 
     // A fixed joint does not have any properties besides the name and relative
     // transforms to its parent and child, which will be taken care of below.
-    joint = _child->moveTo<dart::dynamics::WeldJoint>(_parent);
+    joint = _child_ref->moveTo<dart::dynamics::WeldJoint>(_parent);
   }
 
   const std::string jointName = _sdfJoint.Name();
@@ -1201,7 +1239,7 @@ Identity SDFFeatures::ConstructSdfJoint(
   // when a joint is created.
   // TODO(azeey) Remove incrementVersion once DART has been updated to
   // internally increment the BodyNode's version after Joint::moveTo.
-  _child->incrementVersion();
+  _child_ref->incrementVersion();
 
   return this->GenerateIdentity(jointID, this->joints.at(jointID));
 }
